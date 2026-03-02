@@ -1,0 +1,227 @@
+import imaplib
+import email
+import csv
+import re
+from email.header import decode_header
+from email.utils import parsedate_to_datetime
+
+
+EMAIL_ADDRESS = "info@moscoviti.ru"
+EMAIL_PASSWORD = "jDAO7UsLy58sgBMTObfI"
+
+IMAP_SERVER = "imap.mail.ru"
+IMAP_PORT = 993
+
+OUTPUT_FILE = "ekskursii_vstrechi.csv"
+
+SEARCH_KEYWORDS = [
+    "Сталинских высоток", "Прованса на Сицилию", "Матроны Московской",
+    "монастыри Москвы", "шоколадной розы", "Переделкино",
+    "Москва грузинская", "Концерт на колесах", "поющим экскурсоводом",
+    "Москва в кино", "Есенинская Москва", "Конаково",
+    "Ваганьковское кладбище", "Москва итальянская",
+    "Переславль-Залесский", "Мелихово", "Москва еврейская",
+    "Скандальные хроники", "Романовы", "Булгаковская Москва",
+    "Масонская Москва", "Москва греческая", "старообрядческая",
+    "Москва немецкая", "Зарайск", "Таруса", "Красавица Коломна",
+]
+
+
+def decode_text(value):
+    if not value:
+        return ""
+
+    parts = decode_header(value)
+    result = []
+
+    for part, enc in parts:
+        if isinstance(part, bytes):
+            try:
+                result.append(part.decode(enc or "utf-8", errors="replace"))
+            except Exception:
+                result.append(part.decode("utf-8", errors="replace"))
+        else:
+            result.append(part)
+
+    return "".join(result)
+
+
+def extract_body(msg):
+    text = ""
+
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            charset = part.get_content_charset() or "utf-8"
+
+            try:
+                payload = part.get_payload(decode=True)
+                if not payload:
+                    continue
+
+                decoded = payload.decode(charset, errors="replace")
+
+                if ctype == "text/plain":
+                    return decoded
+
+                if ctype == "text/html" and not text:
+                    decoded = re.sub(r"<[^>]+>", " ", decoded)
+                    decoded = re.sub(r"&nbsp;", " ", decoded)
+                    text = decoded
+            except Exception:
+                pass
+    else:
+        charset = msg.get_content_charset() or "utf-8"
+        try:
+            text = msg.get_payload(decode=True).decode(charset, errors="replace")
+        except Exception:
+            text = str(msg.get_payload())
+
+    return text
+
+
+def get_meeting_block(body):
+    body = body.replace("\r", "\n")
+
+    start = re.search(r"Встречаемся", body, re.I)
+    end = re.search(r"Распечатывать", body, re.I)
+
+    if start and end and start.start() < end.start():
+        return body[start.start():end.start()].strip()
+
+    if start:
+        lines = body[start.start():].split("\n")[:6]
+        return "\n".join(lines).strip()
+
+    return ""
+
+
+def get_excursion_name(subject, body):
+    for source in (subject, body[:400]):
+        m = re.search(r'[«"]([^»"]+)[»"]', source)
+        if m:
+            return m.group(1).strip()
+
+    return subject
+
+
+def get_person_name(body):
+    m = re.search(r"Здравствуйте,\s+(.+?)!", body)
+    return m.group(1).strip() if m else ""
+
+
+def parse_date_time(text):
+    m = re.search(
+        r"(\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|"
+        r"сентября|октября|ноября|декабря)(?:\s+\d{4})?)\s+в\s+(\d{1,2}:\d{2})",
+        text,
+        re.I,
+    )
+    if m:
+        return m.group(1), m.group(2)
+
+    return "", ""
+
+
+def search_by_subject(mail, keyword):
+    try:
+        status, data = mail.search("UTF-8", f'SUBJECT "{keyword}"'.encode("utf-8"))
+        if status == "OK" and data[0]:
+            return data[0].split()
+    except Exception:
+        pass
+
+    try:
+        status, data = mail.search(None, f'SUBJECT "{keyword}"')
+        if status == "OK" and data[0]:
+            return data[0].split()
+    except Exception:
+        pass
+
+    return []
+
+
+def process_emails():
+    results = []
+
+    try:
+        mail = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
+        mail.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
+
+        sent_folder = "Sent"
+
+        status, folders = mail.list()
+        for f in folders:
+            name = f.decode(errors="ignore")
+            if any(x in name for x in ["Sent", "Отправленные", "SENT"]):
+                match = re.search(r'"([^"]+)"$', name)
+                if match:
+                    sent_folder = match.group(1)
+                    break
+
+        mail.select(f'"{sent_folder}"')
+
+        for keyword in SEARCH_KEYWORDS:
+            ids = search_by_subject(mail, keyword)
+            if not ids:
+                continue
+
+            msg_id = ids[-1]
+
+            _, header_data = mail.fetch(
+                msg_id,
+                "(BODY[HEADER.FIELDS (SUBJECT TO DATE)])"
+            )
+
+            header = email.message_from_bytes(header_data[0][1])
+
+            subject = decode_text(header.get("Subject"))
+            to_addr = decode_text(header.get("To"))
+            date_raw = header.get("Date")
+
+            _, msg_data = mail.fetch(msg_id, "(RFC822)")
+            msg = email.message_from_bytes(msg_data[0][1])
+
+            body = extract_body(msg)
+
+            meeting = get_meeting_block(body)
+            excursion = get_excursion_name(subject, body)
+            person = get_person_name(body)
+            date, time = parse_date_time(meeting)
+
+            try:
+                sent_date = parsedate_to_datetime(date_raw).strftime("%d.%m.%Y %H:%M")
+            except Exception:
+                sent_date = date_raw
+
+            results.append({
+                "Экскурсия": excursion,
+                "Дата экскурсии": date,
+                "Время": time,
+                "Информация о встрече": meeting,
+                "Имя": person,
+                "Кому": to_addr,
+                "Дата отправки": sent_date,
+                "Тема письма": subject,
+            })
+
+        mail.logout()
+
+    except imaplib.IMAP4.error:
+        return
+
+    if not results:
+        return
+
+    with open(OUTPUT_FILE, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=list(results[0].keys()),
+            delimiter=";"
+        )
+        writer.writeheader()
+        writer.writerows(results)
+
+
+if __name__ == "__main__":
+    process_emails()
